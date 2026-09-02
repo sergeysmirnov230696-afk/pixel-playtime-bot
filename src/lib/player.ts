@@ -22,7 +22,7 @@ export function usePlayerKey() {
   const [identity, setIdentity] = useState<{
     playerKey: string;
     name: string;
-    referredBy?: string;
+    referredBy?: string | undefined;
   } | null>(null);
 
   useEffect(() => {
