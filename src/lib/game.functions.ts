@@ -56,7 +56,10 @@ export async function loadSettings(): Promise<GameSettings> {
   };
 }
 
-import { createPaykassaInvoice, isAdminKey } from "./paykassa.server";
+/** Server-only module: loaded lazily so it never enters the client bundle. */
+async function pk() {
+  return import("./paykassa.server");
+}
 
 async function admin() {
   const mod = await import("@/integrations/supabase/client.server");
@@ -127,7 +130,7 @@ async function snapshot(playerKey: string): Promise<PlayerSnapshot> {
   ]);
 
   const dragonRows = (dragons ?? []) as unknown as DragonRow[];
-  const settings = await loadSettings();
+  const [settings, { isAdminKey }] = await Promise.all([loadSettings(), pk()]);
   const now = Date.now();
   const { pending, perSecond } = accrual(dragonRows, p.last_accrual, now);
 
