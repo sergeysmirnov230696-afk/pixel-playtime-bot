@@ -169,6 +169,46 @@ async function snapshot(playerKey: string): Promise<PlayerSnapshot> {
   };
 }
 
+/** Credits the inviter once the invited player buys their first dragon. */
+async function payReferralBonus(inviterKey: string, invitedKey: string) {
+  const db = await admin();
+  const settings = await loadSettings();
+  const { data: inviter } = await db
+    .from("players")
+    .select("id, referral_balance")
+    .eq("player_key", inviterKey)
+    .maybeSingle();
+  if (!inviter) return;
+
+  const { data: row } = await db
+    .from("referrals")
+    .select("id, bonus_paid")
+    .eq("inviter_id", inviter.id as string)
+    .eq("invited_key", invitedKey)
+    .maybeSingle();
+  if (row?.bonus_paid) return;
+
+  await db
+    .from("players")
+    .update({
+      referral_balance: +(num(inviter.referral_balance as number) + settings.referralBonus).toFixed(
+        6,
+      ),
+    })
+    .eq("id", inviter.id as string);
+
+  if (row) {
+    await db.from("referrals").update({ bonus_paid: true }).eq("id", row.id as string);
+  } else {
+    await db.from("referrals").insert({
+      inviter_id: inviter.id as string,
+      invited_name: invitedKey,
+      invited_key: invitedKey,
+      bonus_paid: true,
+    });
+  }
+}
+
 const keySchema = z.object({ playerKey: z.string().min(3).max(64) });
 
 export const loadPlayer = createServerFn({ method: "POST" })
@@ -202,18 +242,17 @@ export const loadPlayer = createServerFn({ method: "POST" })
       if (referredBy) {
         const { data: inviter } = await db
           .from("players")
-          .select("id, referral_balance")
+          .select("id")
           .eq("player_key", referredBy)
           .maybeSingle();
         if (inviter) {
+          // Bonus is credited only after the invited player buys their first dragon.
           await db.from("referrals").insert({
             inviter_id: inviter.id as string,
             invited_name: data.name ?? "Player",
+            invited_key: data.playerKey,
+            bonus_paid: false,
           });
-          await db
-            .from("players")
-            .update({ referral_balance: num(inviter.referral_balance as number) + 0.02 })
-            .eq("id", inviter.id as string);
         }
       }
     } else if (data.name) {
@@ -244,20 +283,29 @@ export const buyDragon = createServerFn({ method: "POST" })
     const spec = dragonById(data.dragonId)!;
     const { data: player } = await db
       .from("players")
-      .select("id, balance")
+      .select("id, balance, first_dragon_at, referred_by")
       .eq("player_key", data.playerKey)
       .maybeSingle();
     if (!player) throw new Error("Player not found");
     const balance = num(player.balance as number);
     if (balance < spec.price) throw new Error("INSUFFICIENT_FUNDS");
 
+    const isFirstDragon = !player.first_dragon_at;
+
     await db
       .from("players")
-      .update({ balance: +(balance - spec.price).toFixed(6) })
+      .update({
+        balance: +(balance - spec.price).toFixed(6),
+        ...(isFirstDragon ? { first_dragon_at: new Date().toISOString() } : {}),
+      })
       .eq("id", player.id as string);
     await db
       .from("player_dragons")
       .insert({ player_id: player.id as string, dragon_id: spec.id });
+
+    if (isFirstDragon && player.referred_by) {
+      await payReferralBonus(player.referred_by as string, data.playerKey);
+    }
 
     return snapshot(data.playerKey);
   });
@@ -283,7 +331,8 @@ export const collectIncome = createServerFn({ method: "POST" })
       player.last_accrual as string,
       now,
     );
-    if (pending <= 0) throw new Error("NOTHING_TO_COLLECT");
+    const settings = await loadSettings();
+    if (pending < settings.minCollect) throw new Error("MIN_COLLECT");
 
     await db
       .from("players")
@@ -324,34 +373,69 @@ export const collectReferral = createServerFn({ method: "POST" })
 export const createDeposit = createServerFn({ method: "POST" })
   .inputValidator((data: unknown) =>
     keySchema
-      .extend({ method: z.enum(CURRENCY_CODES), amount: z.number().min(MIN_AMOUNT).max(100000) })
+      .extend({ method: z.enum(CURRENCY_CODES), amount: z.number().positive().max(100000) })
       .parse(data),
   )
   .handler(async ({ data }) => {
     const db = await admin();
+    const settings = await loadSettings();
+    if (data.amount < settings.minDeposit) throw new Error("MIN_DEPOSIT");
+
     const { data: player } = await db
       .from("players")
       .select("id")
       .eq("player_key", data.playerKey)
       .maybeSingle();
     if (!player) throw new Error("Player not found");
-    await db.from("transactions").insert({
-      player_id: player.id as string,
-      kind: "deposit",
-      method: data.method,
-      amount: data.amount,
-    });
+
+    const { data: tx, error } = await db
+      .from("transactions")
+      .insert({
+        player_id: player.id as string,
+        kind: "deposit",
+        method: data.method,
+        amount: data.amount,
+      })
+      .select("id")
+      .single();
+    if (error || !tx) throw new Error(error?.message ?? "DEPOSIT_FAILED");
+
+    const { createPaykassaInvoice } = await pk();
+    try {
+      const invoice = await createPaykassaInvoice({
+        orderId: tx.id as string,
+        amount: data.amount,
+        method: data.method,
+        comment: `DragonVault ${data.playerKey}`,
+      });
+      await db
+        .from("transactions")
+        .update({
+          address: invoice.tag ? `${invoice.address} (memo: ${invoice.tag})` : invoice.address,
+          invoice_id: tx.id as string,
+        })
+        .eq("id", tx.id as string);
+    } catch (e) {
+      await db
+        .from("transactions")
+        .update({ status: "rejected", admin_note: (e as Error).message })
+        .eq("id", tx.id as string);
+      throw e;
+    }
+
     return snapshot(data.playerKey);
   });
 
 export const createWithdraw = createServerFn({ method: "POST" })
   .inputValidator((data: unknown) =>
     keySchema
-      .extend({ method: z.enum(CURRENCY_CODES), amount: z.number().min(MIN_AMOUNT).max(100000) })
+      .extend({ method: z.enum(CURRENCY_CODES), amount: z.number().positive().max(100000) })
       .parse(data),
   )
   .handler(async ({ data }) => {
     const db = await admin();
+    const settings = await loadSettings();
+    if (data.amount < settings.minWithdraw) throw new Error("MIN_WITHDRAW");
     const { data: player } = await db
       .from("players")
       .select("id, balance, addresses")
