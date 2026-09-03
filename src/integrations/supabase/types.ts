@@ -14,6 +14,36 @@ export type Database = {
   }
   public: {
     Tables: {
+      game_settings: {
+        Row: {
+          id: boolean
+          min_collect: number
+          min_deposit: number
+          min_withdraw: number
+          referral_bonus: number
+          referral_percent: number
+          updated_at: string
+        }
+        Insert: {
+          id?: boolean
+          min_collect?: number
+          min_deposit?: number
+          min_withdraw?: number
+          referral_bonus?: number
+          referral_percent?: number
+          updated_at?: string
+        }
+        Update: {
+          id?: boolean
+          min_collect?: number
+          min_deposit?: number
+          min_withdraw?: number
+          referral_bonus?: number
+          referral_percent?: number
+          updated_at?: string
+        }
+        Relationships: []
+      }
       player_dragons: {
         Row: {
           bought_at: string
@@ -49,6 +79,7 @@ export type Database = {
           balance: number
           collected: number
           created_at: string
+          first_dragon_at: string | null
           id: string
           language: string
           last_accrual: string
@@ -62,6 +93,7 @@ export type Database = {
           balance?: number
           collected?: number
           created_at?: string
+          first_dragon_at?: string | null
           id?: string
           language?: string
           last_accrual?: string
@@ -75,6 +107,7 @@ export type Database = {
           balance?: number
           collected?: number
           created_at?: string
+          first_dragon_at?: string | null
           id?: string
           language?: string
           last_accrual?: string
@@ -87,26 +120,32 @@ export type Database = {
       }
       referrals: {
         Row: {
+          bonus_paid: boolean
           created_at: string
           deposit: number
           id: string
           income: number
+          invited_key: string | null
           invited_name: string
           inviter_id: string
         }
         Insert: {
+          bonus_paid?: boolean
           created_at?: string
           deposit?: number
           id?: string
           income?: number
+          invited_key?: string | null
           invited_name: string
           inviter_id: string
         }
         Update: {
+          bonus_paid?: boolean
           created_at?: string
           deposit?: number
           id?: string
           income?: number
+          invited_key?: string | null
           invited_name?: string
           inviter_id?: string
         }
@@ -122,31 +161,46 @@ export type Database = {
       }
       transactions: {
         Row: {
+          address: string | null
+          admin_note: string | null
           amount: number
           created_at: string
           id: string
+          invoice_id: string | null
           kind: string
           method: string
           player_id: string
           status: string
+          txid: string | null
+          updated_at: string
         }
         Insert: {
+          address?: string | null
+          admin_note?: string | null
           amount: number
           created_at?: string
           id?: string
+          invoice_id?: string | null
           kind: string
           method: string
           player_id: string
           status?: string
+          txid?: string | null
+          updated_at?: string
         }
         Update: {
+          address?: string | null
+          admin_note?: string | null
           amount?: number
           created_at?: string
           id?: string
+          invoice_id?: string | null
           kind?: string
           method?: string
           player_id?: string
           status?: string
+          txid?: string | null
+          updated_at?: string
         }
         Relationships: [
           {

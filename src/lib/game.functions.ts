@@ -1,6 +1,6 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
-import { CURRENCY_CODES, DRAGONS, MIN_AMOUNT, dragonById } from "./dragons";
+import { CURRENCY_CODES, DRAGONS, dragonById } from "./dragons";
 
 export type PlayerSnapshot = {
   playerKey: string;
@@ -11,6 +11,8 @@ export type PlayerSnapshot = {
   pending: number;
   perSecond: number;
   language: "en" | "ru";
+  isAdmin: boolean;
+  settings: GameSettings;
   addresses: Record<string, string>;
   dragons: { id: string; dragonId: number; boughtAt: string; expired: boolean }[];
   transactions: {
@@ -19,10 +21,45 @@ export type PlayerSnapshot = {
     method: string;
     amount: number;
     status: string;
+    address: string | null;
     createdAt: string;
   }[];
   referrals: { invitedName: string; deposit: number; income: number; createdAt: string }[];
 };
+
+export type GameSettings = {
+  minDeposit: number;
+  minWithdraw: number;
+  minCollect: number;
+  referralPercent: number;
+  referralBonus: number;
+};
+
+const DEFAULT_SETTINGS: GameSettings = {
+  minDeposit: 1,
+  minWithdraw: 1,
+  minCollect: 0.01,
+  referralPercent: 15,
+  referralBonus: 0.02,
+};
+
+export async function loadSettings(): Promise<GameSettings> {
+  const db = await admin();
+  const { data } = await db.from("game_settings").select("*").eq("id", true).maybeSingle();
+  if (!data) return DEFAULT_SETTINGS;
+  return {
+    minDeposit: Number(data.min_deposit ?? DEFAULT_SETTINGS.minDeposit),
+    minWithdraw: Number(data.min_withdraw ?? DEFAULT_SETTINGS.minWithdraw),
+    minCollect: Number(data.min_collect ?? DEFAULT_SETTINGS.minCollect),
+    referralPercent: Number(data.referral_percent ?? DEFAULT_SETTINGS.referralPercent),
+    referralBonus: Number(data.referral_bonus ?? DEFAULT_SETTINGS.referralBonus),
+  };
+}
+
+/** Server-only module: loaded lazily so it never enters the client bundle. */
+async function pk() {
+  return import("./paykassa.server");
+}
 
 async function admin() {
   const mod = await import("@/integrations/supabase/client.server");
@@ -93,6 +130,7 @@ async function snapshot(playerKey: string): Promise<PlayerSnapshot> {
   ]);
 
   const dragonRows = (dragons ?? []) as unknown as DragonRow[];
+  const [settings, { isAdminKey }] = await Promise.all([loadSettings(), pk()]);
   const now = Date.now();
   const { pending, perSecond } = accrual(dragonRows, p.last_accrual, now);
 
@@ -105,6 +143,8 @@ async function snapshot(playerKey: string): Promise<PlayerSnapshot> {
     pending,
     perSecond,
     language: p.language === "ru" ? "ru" : "en",
+    isAdmin: isAdminKey(p.player_key),
+    settings,
     addresses: (p.addresses as Record<string, string>) ?? {},
     dragons: dragonRows.map((d) => {
       const spec = dragonById(d.dragon_id);
@@ -113,6 +153,7 @@ async function snapshot(playerKey: string): Promise<PlayerSnapshot> {
     }),
     transactions: (txs ?? []).map((t) => ({
       id: t.id as string,
+      address: (t.address as string | null) ?? null,
       kind: t.kind as "deposit" | "withdraw",
       method: t.method as string,
       amount: num(t.amount as number),
@@ -126,6 +167,46 @@ async function snapshot(playerKey: string): Promise<PlayerSnapshot> {
       createdAt: r.created_at as string,
     })),
   };
+}
+
+/** Credits the inviter once the invited player buys their first dragon. */
+async function payReferralBonus(inviterKey: string, invitedKey: string) {
+  const db = await admin();
+  const settings = await loadSettings();
+  const { data: inviter } = await db
+    .from("players")
+    .select("id, referral_balance")
+    .eq("player_key", inviterKey)
+    .maybeSingle();
+  if (!inviter) return;
+
+  const { data: row } = await db
+    .from("referrals")
+    .select("id, bonus_paid")
+    .eq("inviter_id", inviter.id as string)
+    .eq("invited_key", invitedKey)
+    .maybeSingle();
+  if (row?.bonus_paid) return;
+
+  await db
+    .from("players")
+    .update({
+      referral_balance: +(num(inviter.referral_balance as number) + settings.referralBonus).toFixed(
+        6,
+      ),
+    })
+    .eq("id", inviter.id as string);
+
+  if (row) {
+    await db.from("referrals").update({ bonus_paid: true }).eq("id", row.id as string);
+  } else {
+    await db.from("referrals").insert({
+      inviter_id: inviter.id as string,
+      invited_name: invitedKey,
+      invited_key: invitedKey,
+      bonus_paid: true,
+    });
+  }
 }
 
 const keySchema = z.object({ playerKey: z.string().min(3).max(64) });
@@ -161,18 +242,17 @@ export const loadPlayer = createServerFn({ method: "POST" })
       if (referredBy) {
         const { data: inviter } = await db
           .from("players")
-          .select("id, referral_balance")
+          .select("id")
           .eq("player_key", referredBy)
           .maybeSingle();
         if (inviter) {
+          // Bonus is credited only after the invited player buys their first dragon.
           await db.from("referrals").insert({
             inviter_id: inviter.id as string,
             invited_name: data.name ?? "Player",
+            invited_key: data.playerKey,
+            bonus_paid: false,
           });
-          await db
-            .from("players")
-            .update({ referral_balance: num(inviter.referral_balance as number) + 0.02 })
-            .eq("id", inviter.id as string);
         }
       }
     } else if (data.name) {
@@ -203,20 +283,29 @@ export const buyDragon = createServerFn({ method: "POST" })
     const spec = dragonById(data.dragonId)!;
     const { data: player } = await db
       .from("players")
-      .select("id, balance")
+      .select("id, balance, first_dragon_at, referred_by")
       .eq("player_key", data.playerKey)
       .maybeSingle();
     if (!player) throw new Error("Player not found");
     const balance = num(player.balance as number);
     if (balance < spec.price) throw new Error("INSUFFICIENT_FUNDS");
 
+    const isFirstDragon = !player.first_dragon_at;
+
     await db
       .from("players")
-      .update({ balance: +(balance - spec.price).toFixed(6) })
+      .update({
+        balance: +(balance - spec.price).toFixed(6),
+        ...(isFirstDragon ? { first_dragon_at: new Date().toISOString() } : {}),
+      })
       .eq("id", player.id as string);
     await db
       .from("player_dragons")
       .insert({ player_id: player.id as string, dragon_id: spec.id });
+
+    if (isFirstDragon && player.referred_by) {
+      await payReferralBonus(player.referred_by as string, data.playerKey);
+    }
 
     return snapshot(data.playerKey);
   });
@@ -242,7 +331,8 @@ export const collectIncome = createServerFn({ method: "POST" })
       player.last_accrual as string,
       now,
     );
-    if (pending <= 0) throw new Error("NOTHING_TO_COLLECT");
+    const settings = await loadSettings();
+    if (pending < settings.minCollect) throw new Error("MIN_COLLECT");
 
     await db
       .from("players")
@@ -283,34 +373,69 @@ export const collectReferral = createServerFn({ method: "POST" })
 export const createDeposit = createServerFn({ method: "POST" })
   .inputValidator((data: unknown) =>
     keySchema
-      .extend({ method: z.enum(CURRENCY_CODES), amount: z.number().min(MIN_AMOUNT).max(100000) })
+      .extend({ method: z.enum(CURRENCY_CODES), amount: z.number().positive().max(100000) })
       .parse(data),
   )
   .handler(async ({ data }) => {
     const db = await admin();
+    const settings = await loadSettings();
+    if (data.amount < settings.minDeposit) throw new Error("MIN_DEPOSIT");
+
     const { data: player } = await db
       .from("players")
       .select("id")
       .eq("player_key", data.playerKey)
       .maybeSingle();
     if (!player) throw new Error("Player not found");
-    await db.from("transactions").insert({
-      player_id: player.id as string,
-      kind: "deposit",
-      method: data.method,
-      amount: data.amount,
-    });
+
+    const { data: tx, error } = await db
+      .from("transactions")
+      .insert({
+        player_id: player.id as string,
+        kind: "deposit",
+        method: data.method,
+        amount: data.amount,
+      })
+      .select("id")
+      .single();
+    if (error || !tx) throw new Error(error?.message ?? "DEPOSIT_FAILED");
+
+    const { createPaykassaInvoice } = await pk();
+    try {
+      const invoice = await createPaykassaInvoice({
+        orderId: tx.id as string,
+        amount: data.amount,
+        method: data.method,
+        comment: `DragonVault ${data.playerKey}`,
+      });
+      await db
+        .from("transactions")
+        .update({
+          address: invoice.tag ? `${invoice.address} (memo: ${invoice.tag})` : invoice.address,
+          invoice_id: tx.id as string,
+        })
+        .eq("id", tx.id as string);
+    } catch (e) {
+      await db
+        .from("transactions")
+        .update({ status: "rejected", admin_note: (e as Error).message })
+        .eq("id", tx.id as string);
+      throw e;
+    }
+
     return snapshot(data.playerKey);
   });
 
 export const createWithdraw = createServerFn({ method: "POST" })
   .inputValidator((data: unknown) =>
     keySchema
-      .extend({ method: z.enum(CURRENCY_CODES), amount: z.number().min(MIN_AMOUNT).max(100000) })
+      .extend({ method: z.enum(CURRENCY_CODES), amount: z.number().positive().max(100000) })
       .parse(data),
   )
   .handler(async ({ data }) => {
     const db = await admin();
+    const settings = await loadSettings();
+    if (data.amount < settings.minWithdraw) throw new Error("MIN_WITHDRAW");
     const { data: player } = await db
       .from("players")
       .select("id, balance, addresses")
