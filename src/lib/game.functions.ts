@@ -1,6 +1,6 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
-import { CURRENCY_CODES, DRAGONS, MIN_AMOUNT, dragonById } from "./dragons";
+import { CURRENCY_CODES, DRAGONS, dragonById } from "./dragons";
 
 export type PlayerSnapshot = {
   playerKey: string;
@@ -11,6 +11,8 @@ export type PlayerSnapshot = {
   pending: number;
   perSecond: number;
   language: "en" | "ru";
+  isAdmin: boolean;
+  settings: GameSettings;
   addresses: Record<string, string>;
   dragons: { id: string; dragonId: number; boughtAt: string; expired: boolean }[];
   transactions: {
@@ -19,10 +21,42 @@ export type PlayerSnapshot = {
     method: string;
     amount: number;
     status: string;
+    address: string | null;
     createdAt: string;
   }[];
   referrals: { invitedName: string; deposit: number; income: number; createdAt: string }[];
 };
+
+export type GameSettings = {
+  minDeposit: number;
+  minWithdraw: number;
+  minCollect: number;
+  referralPercent: number;
+  referralBonus: number;
+};
+
+const DEFAULT_SETTINGS: GameSettings = {
+  minDeposit: 1,
+  minWithdraw: 1,
+  minCollect: 0.01,
+  referralPercent: 15,
+  referralBonus: 0.02,
+};
+
+export async function loadSettings(): Promise<GameSettings> {
+  const db = await admin();
+  const { data } = await db.from("game_settings").select("*").eq("id", true).maybeSingle();
+  if (!data) return DEFAULT_SETTINGS;
+  return {
+    minDeposit: Number(data.min_deposit ?? DEFAULT_SETTINGS.minDeposit),
+    minWithdraw: Number(data.min_withdraw ?? DEFAULT_SETTINGS.minWithdraw),
+    minCollect: Number(data.min_collect ?? DEFAULT_SETTINGS.minCollect),
+    referralPercent: Number(data.referral_percent ?? DEFAULT_SETTINGS.referralPercent),
+    referralBonus: Number(data.referral_bonus ?? DEFAULT_SETTINGS.referralBonus),
+  };
+}
+
+import { createPaykassaInvoice, isAdminKey } from "./paykassa.server";
 
 async function admin() {
   const mod = await import("@/integrations/supabase/client.server");
@@ -93,6 +127,7 @@ async function snapshot(playerKey: string): Promise<PlayerSnapshot> {
   ]);
 
   const dragonRows = (dragons ?? []) as unknown as DragonRow[];
+  const settings = await loadSettings();
   const now = Date.now();
   const { pending, perSecond } = accrual(dragonRows, p.last_accrual, now);
 
@@ -105,6 +140,8 @@ async function snapshot(playerKey: string): Promise<PlayerSnapshot> {
     pending,
     perSecond,
     language: p.language === "ru" ? "ru" : "en",
+    isAdmin: isAdminKey(p.player_key),
+    settings,
     addresses: (p.addresses as Record<string, string>) ?? {},
     dragons: dragonRows.map((d) => {
       const spec = dragonById(d.dragon_id);
@@ -113,6 +150,7 @@ async function snapshot(playerKey: string): Promise<PlayerSnapshot> {
     }),
     transactions: (txs ?? []).map((t) => ({
       id: t.id as string,
+      address: (t.address as string | null) ?? null,
       kind: t.kind as "deposit" | "withdraw",
       method: t.method as string,
       amount: num(t.amount as number),
